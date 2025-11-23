@@ -1,11 +1,5 @@
 from math import prod
-
-from grammar import (
-    Grammar,
-    token,
-    rule,
-)
-
+from grammar import Grammar, token, rule
 
 class Calculator(Grammar):
     number = token(r"\d+", int)
@@ -25,6 +19,10 @@ class Calculator(Grammar):
     @rule("<expr:x> '*' <expr:y>", prec=20, assoc="left")
     def expr_mul(self, x, y):
         return x * y
+
+    @rule("<expr:x> '/' <expr:y>", prec=20, assoc="left")
+    def expr_div(self, x, y):
+        return x / y
 
     @rule("'-' <expr:x>", prec=30, unary="prefix")
     def expr_neg(self, x):
@@ -50,7 +48,7 @@ if __name__ == "__main__":
         "2 * 3 + 4", # 10
         "2 * (3 + 4)", # 14
         "3! + 1", # 7
+        "5! / 5", # 24.0
     ]
     for t in tests:
         print(t, "->", calc.parse(t))
-        

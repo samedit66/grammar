@@ -1,6 +1,22 @@
-# grammar
+# grammar - tiny parsing DSL
 
-Tiny, pleasant-to-use, declarative parsing mini-library that combines a small pattern DSL with per-rule precedence and limited left-recursion handling. It’s intended for small DSLs and teaching, **not** as a production-grade parser generator.
+A small, pleasant-to-use declarative parsing mini-library with a compact pattern DSL, per-alternative precedence, limited left-recursive operator support, and convenient repetition/quantifier syntax. Intended for small DSLs, examples, and teaching - not a production-grade parser generator.
+
+---
+
+## Features
+
+A tiny parser you actually want to write grammars in - readable, pragmatic, and a little clever.
+
+- **Friendly DSL.** Patterns are compact and clear: named captures, quoted literals, and bare punctuation all work together so rules read like the grammar in your head.
+- **Straightforward repetition.** Built-in quantifiers let you write lists and repetitions without awkward recursion: `<item*:xs>`, `<item+:xs>`, `[ ... ]:list` and `{ ... }:list` give you easy access to lists of captured values.
+- **Optionals with defaults.** Want a value when something’s missing? Use `<field?:name=42>` or just `<field?:name>` (gets `None` when absent).
+- **Real operator support.** Left-recursive operator forms with per-alternative `prec` and `assoc` make arithmetic and expression grammars concise and correct. Prefix/postfix unary forms supported too.
+- **Lightweight hooks.** `@rule(..., transform=..., validate=...)` lets you normalize or reject captures before the semantic action runs - great for tidy semantics.
+- **Smarter lexing.** `token()` auto-decides whether to wrap patterns with `\b` and won’t accidentally break tokens such as negative numbers or exponent notation.
+- **Helpful errors and decent speed.** Error messages include line/column and friendly hints for failed group matches. A conservative per-parse memo cache speeds up heavier grammars without changing semantics.
+
+---
 
 # Installation
 
@@ -10,17 +26,13 @@ I'm not planning on uploading `grammar` to **PyPi**, so if you want to install, 
 pip install git+https://github.com/samedit66/grammar.git
 ```
 
-# Example
+---
 
-```python
+## Quick example - calculator
+
+```py
 from math import prod
-
-from grammar import (
-    Grammar,
-    token,
-    rule,
-)
-
+from grammar import Grammar, token, rule
 
 class Calculator(Grammar):
     number = token(r"\d+", int)
@@ -40,6 +52,10 @@ class Calculator(Grammar):
     @rule("<expr:x> '*' <expr:y>", prec=20, assoc="left")
     def expr_mul(self, x, y):
         return x * y
+
+    @rule("<expr:x> '/' <expr:y>", prec=20, assoc="left")
+    def expr_div(self, x, y):
+        return x / y
 
     @rule("'-' <expr:x>", prec=30, unary="prefix")
     def expr_neg(self, x):
@@ -65,124 +81,76 @@ if __name__ == "__main__":
         "2 * 3 + 4", # 10
         "2 * (3 + 4)", # 14
         "3! + 1", # 7
+        "5! / 5", # 24.0
     ]
     for t in tests:
         print(t, "->", calc.parse(t))
 ```
 
-# API summary
+See [examples](./examples) folder for other grammars like [JSON](./examples/json_grammar.py) or [TinyBasic](./examples/tiny_basic.py).
 
-Each grammar is a separate class. To define one, you should subclass `Grammar` and define tokens and rules.
+---
 
-Say we have the following grammar:
+## Pattern syntax
 
-```python
-from grammar import Grammar, token, rule
+- `'<lit>'` or `"<lit>"` - literal text. Unquoted punctuation such as `,` is also accepted.
+- `<NAME:var>` - reference to a token or rule `NAME`; when `:var` is present the matched value is passed as an argument to the semantic function.
+- `<NAME?:var>` - optional reference; if missing and `:var` provided the var receives `None` (or a default if specified - see below).
+- `<NAME?:var=DEFAULT>` - optional with default value; `DEFAULT` is parsed with Python literal rules where possible (numbers, quoted strings); otherwise it is treated as a raw string.
+- `<NAME*:xs>` - zero-or-more repetition of a **single** reference; when named (here `xs`) yields a `list` (possibly empty) of matched values.
+- `<NAME+:xs>` - one-or-more repetition of a single reference; named capture yields a non-empty `list`.
+- `[ ... ]:name` - group repetition (zero-or-more): the group inner pattern is attempted repeatedly; if `:name` is provided you get a `list` of items where each item is either the single captured value (if the inner sequence had exactly one named capture) or a `tuple` of captures.
+- `{ ... }:name` - group repetition (one-or-more): fails if zero occurrences were found.
 
-class MyGrammar(Grammar):
+Examples:
+
+- `@rule("<expr:x> [',' <expr:y>]:rest")` → `x` is first `expr`, `rest` is a list of following exprs.
+- `@rule("<id?:name='anon'>")` → `name` will be the matched id, or `'anon'` if missing.
+- `@rule("<num*:ns>")` → `ns` becomes a list of numbers (maybe empty).
+
+---
+
+## `token()` and word-boundary heuristics
+
+`token(pattern, convert=None, with_word_boundaries=None, ignore_case=False)` defines a lexical token. When `with_word_boundaries` is not supplied the library attempts to automatically decide whether to wrap the regex with `\b...\b`.
+
+The heuristics were improved so that patterns which contain letters but do **not** start with an alphanumeric character (for example, a numeric token beginning with `-` that contains `e` for exponent) **are not** wrapped with `\b` - this prevents spurious mismatches like `-12.34e+2` failing to match.
+
+If you want to force `\b` behavior, pass `with_word_boundaries=True` explicitly.
+
+---
+
+## `@rule` options: `transform` and `validate`
+
+You can now pass two convenient hooks to `@rule`:
+
+- `transform: Callable[[List[Any]], Any]` - receives the *raw captured argument list* and should return either:
+  - an iterable (list/tuple) which will be used as the argument list for the semantic function; or
+  - a single value (it will be passed as one argument); or
+  - `None` to indicate this alternative should be treated as NOT matched.
+
+- `validate: Callable[[List[Any]], bool]` - receives the raw captured args and returns `True` to accept or `False` to reject this alternative (rejection behaves like no match).
+
+These hooks allow you to do lightweight checks and normalization right next to the grammar instead of inside semantic actions.
+
+Example:
+
+```py
+@rule('<pair:first> [<COMMA> <pair:p>]:rest', name='object',
+      validate=lambda args: all(isinstance(k, str) for k, _ in ([args[0]] + args[1])),
+      transform=lambda args: args[0] if len(args) == 1 else args)
+def object_nonempty(self, first, rest):
     ...
 ```
 
-Any following token or rule definition is inside the `MyGrammar` class.
+---
 
-Declare tokens:
+## Memoization
 
-```python
-# token(
-#     pattern: str,
-#     convert: Optional[Callable[[str], Any]] = None,
-#     with_word_boundaries: Optional[bool] = None,
-#     ignore_case: bool = False,
-# )
-NUMBER = token(r'\d+', int)
-VAR    = token(r'[A-Za-z]', lambda s: s.upper())
-```
+The engine uses a conservative per-parse memo cache keyed by `(rule_name, position, min_prec)` to reduce repeated work. This speeds many grammars, but the cache is intentionally conservative to remain compatible with the left-recursive growth algorithm. You don’t need to enable anything - the `parse()` entrypoint initializes the cache automatically.
 
-- *pattern* is a regular expression (used with `regex.match` at current parse position).
-- *convert* is optional; when provided it is called with the matched text and its return value is passed to semantic actions.
-- *with_word_boundaries* controls whether word boundaries (aka `\b`) are inserted; defaults to automatic detection.
-- *ignore_case* ignores case of string literals.
+---
 
-Declare rules with `@rule(...)` decorating methods:
+## Error messages
 
-```python
-@rule("<expr:x> '+' <expr:y>", prec=10, assoc='left')
-def expr_add(self, x, y): return x + y
-```
-
-### Pattern syntax
-
-`<NAME:var>` -- reference to a token or rule named NAME. If `:var` is present, that element is passed as an argument to the semantic function.
-
-Literals: `'+', '(', ')'` or bare punctuation `+` (single tokens without quotes are also accepted).
-
-Alternatives separated by `|` are supported in a single pattern string (but many examples use multiple decorated functions).
-
-Whitespace is skipped between pattern elements automatically (configurable via `Grammar(skip_whitespace=False)`).
-
-`@rule` keyword args:
-
-- `name` (optional): the logical rule name this alternative belongs to. If omitted, the library derives it from the function name by stripping the last _suffix (i.e. expr_add → rule name expr; expr_list_append → expr_list). Use name to be explicit.
-
-- `prec` (optional): integer precedence for left-recursive operator-style alternatives. Larger means binds tighter.
-
-- `assoc`: `'left'` or `'right'`. Default `'left'`.
-
-- unary: `None`, `'prefix'`, or `'postfix'`. Use for unary forms (e.g. `- <expr>`).
-
-Start parsing:
-
-```python
-g = MyGrammar()
-result = g.parse("...")           # starts at rule "top" if present, otherwise first collected rule
-result = g.parse("...", start_rule="line")  # optionally pick a start rule
-```
-
-### How to describe multiple alternatives for the same rule
-
-Two recommended ways:
-
-1. By function name convention -- give functions names of the form <rulename>_<altname>:
-
-```python
-@rule("<expr:x> '+' <expr:y>", prec=10)
-def expr_add(self, x, y): ...
-
-@rule("<expr:x> '*' <expr:y>", prec=20)
-def expr_mul(self, x, y): ...
-```
-
-The engine derives the rule name by removing the last _suffix:
-- expr_add -> rule expr.
-- expr_list_items -> rule expr.
-
-2. Explicit rule name -- pass `name="expr"` to `@rule`:
-
-```python
-@rule("<expr:x> '+' <expr:y>", name="expr", prec=10)
-def add(self, x, y): ...
-```
-
-This is recommended when your function name doesn't follow the `<rulename>_<suffix>` pattern or for multi-word rule names (like `exprlist`) to avoid ambiguity.
-
-## Error messages & location
-
-`ParseError` includes line, column, a snippet of the offending line and a caret pointing to the position. When possible it lists expected tokens.
-
-## Implementation notes & limitations
-
-- Supports direct left-recursive operator patterns such as `<expr> '+' <expr>`.
-
-- Precedence is per-alternative (`prec`) and associativity is supported (`assoc`).
-
-- Unary prefix/postfix alternatives supported via unary argument.
-
-## Limitations:
-
-- No full packrat memoization (no memoization). Some grammars may backtrack and run slowly.
-
-- Repetition `((A (',' A)*))` is implemented by left-recursive append rules or manual loop in semantic actions. There is no built-in `many()` or repetition operator yet.
-
-- Tail recursion inside left-recursive alternatives is permitted for the immediate RHS (common operator grammars) but complex nested left-recursion patterns may not be supported.
-
-- Error messages are 'best effort'--they reflect the matching attempt where failure occurred.
+`ParseError` shows line, column, a snippet of the failing line and a caret pointing to the position. When group repetitions fail (for example a required `{ ... }` didn't match any occurrences) the error now includes a friendly expected hint such as `one or more '<item>'` when possible.
