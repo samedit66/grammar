@@ -1,4 +1,5 @@
 import re
+import ast
 from abc import ABC
 from typing import Optional, Callable, List, Tuple, Any
 
@@ -22,36 +23,34 @@ def token(
     ignore_case: bool = False,
 ):
     """
-    Smarter token() that auto-decides word boundaries if None:
+    Smarter token() that auto-decides word boundaries if None.
 
-    - If pattern starts with [A-Za-z0-9] → use word boundaries
-    - If pattern contains only punctuation → do NOT use word boundaries
-    - Otherwise, if pattern contains letters → apply word boundaries
-    - Otherwise → do not apply
+    Fix: if a pattern contains letters (like 'e' in exponents) but does NOT
+    start with an alphanumeric character, do NOT add word boundaries.
+    This prevents negative-number patterns (starting with '-') from being
+    wrapped with \b which would prevent matching.
     """
-
     def auto_decide(pattern: str) -> bool:
-        # strip grouping parentheses
         p = pattern.strip()
 
-        # Heuristic 1: looks like a bare IDENTIFIER or KEYWORD token
-        # Example: "PRINT" or "[A-Za-z]"
+        # Heuristic A: pattern starts with alnum → use word boundaries
         if re.match(r"[A-Za-z0-9]", p):
             return True
 
-        # Extract raw characters (ignoring escape sequences)
+        # Strip backslash-escapes for analysis
         raw = re.sub(r"\\.", "", p)
 
-        # Heuristic 2: only punctuation operators
-        # Example: "<=", "<>", "<", "=", "+", "-"
+        # Heuristic B: only punctuation/operator-like → do NOT use word boundaries
         if re.fullmatch(r"[\W_]+", raw) and not re.search(r"[A-Za-z0-9]", raw):
             return False
 
-        # Heuristic 3: complex pattern containing alpha → probably identifiers
-        if re.search(r"[A-Za-z]", raw):
+        # Heuristic C (changed): If the pattern contains alphabetic letters,
+        # only apply word boundaries if the original pattern also starts with
+        # an alphanumeric (to avoid cases like "-? ... e ..." being wrapped).
+        if re.search(r"[A-Za-z]", raw) and re.match(r"[A-Za-z0-9]", p):
             return True
 
-        # Default: no word boundaries
+        # Default: do not apply word boundaries
         return False
 
     # If user did NOT specify with_word_boundaries → compute
@@ -78,15 +77,13 @@ def rule(
     prec: Optional[int] = None,
     assoc: str = "left",
     unary: Optional[str] = None,
+    transform: Optional[Callable[[List[Any]], Any]] = None,
+    validate: Optional[Callable[[List[Any]], bool]] = None,
 ):
-    """Decorator for rule alternatives.
-
-    pattern: DSL with <name:var> references and literals (same as earlier).
-    Optional keyword args:
-      - prec: precedence (int). If provided and the alt is left-recursive (starts with <rule:...>),
-              it will be considered a binary operator alt with that precedence.
-      - assoc: 'left' or 'right' (used when prec provided).
-      - unary: None or 'prefix' or 'postfix' (for unary ops, e.g. "- <expr>" or "<expr> '!'")
+    """
+    rule decorator. New kwargs:
+      - transform: callable(args_list) -> iterable/new args (or None to reject alt)
+      - validate: callable(args_list) -> bool (False => treat as not matched)
     """
     if assoc not in ("left", "right"):
         raise ValueError("assoc must be 'left' or 'right'")
@@ -94,7 +91,6 @@ def rule(
         raise ValueError("unary must be None|'prefix'|'postfix'")
 
     def decorator(fn):
-        # attach metadata to function; a function may be decorated multiple times
         if not hasattr(fn, "_rule_alts"):
             fn._rule_alts = []
         fn._rule_alts.append(
@@ -104,6 +100,8 @@ def rule(
                 "assoc": assoc,
                 "unary": unary,
                 "rule_name": name,
+                "transform": transform,
+                "validate": validate,
             }
         )
         fn._is_rule = True
@@ -130,10 +128,6 @@ class Grammar(ABC):
         for func_name, attr in self.__class__.__dict__.items():
             if hasattr(attr, "_is_rule"):
                 for alt_meta in getattr(attr, "_rule_alts", []):
-                    # explicit rule name if provided, otherwise derive:
-                    # - if name supplied in decorator use it
-                    # - else if function name contains '_' take prefix before '_' (expr_add -> expr)
-                    # - else use full function name
                     rule_name = alt_meta.get("rule_name")
                     if not rule_name:
                         if "_" in func_name:
@@ -149,42 +143,156 @@ class Grammar(ABC):
                         "assoc": alt_meta["assoc"],
                         "unary": alt_meta["unary"],
                         "func": getattr(self, func_name),  # bound method
+                        "transform": alt_meta.get("transform"),
+                        "validate": alt_meta.get("validate"),
                     }
                     if rule_name not in self._rules:
                         self._rules[rule_name] = []
                         self._rule_order.append(rule_name)
                     self._rules[rule_name].append(alt)
 
-    # pattern parser: same DSL as before
+    # new pattern parser: supports:
+    #  - <name:var> or <name?:var> (optional)
+    #  - <name*:var> and <name+:var> (star/plus quantifiers inside angle brackets)
+    #  - [ ... ]:var  zero-or-more (group)
+    #  - { ... }:var  one-or-more (group)
+    #  - optional var default: <name?:var=42>
+    #  - literals in single/double quotes or bare punctuation tokens (',' etc.)
     def _parse_pattern(self, pattern: str):
-        elements = []
-        pos = 0
-        token_re = re.compile(r"<([^:>]+)(?::([^>]+))?>")
-        while pos < len(pattern):
-            m = token_re.search(pattern, pos)
-            if not m:
-                chunk = pattern[pos:].strip()
-                if chunk:
-                    parts = re.findall(r"'([^']*)'|\"([^\"]*)\"|(\S+)", chunk)
-                    for a, b, c in parts:
-                        lit = a or b or c
-                        elements.append(("lit", lit))
-                break
-            # literal before
-            if m.start() > pos:
-                chunk = pattern[pos : m.start()].strip()
-                if chunk:
-                    parts = re.findall(r"'([^']*)'|\"([^\"]*)\"|(\S+)", chunk)
-                    for a, b, c in parts:
-                        lit = a or b or c
-                        elements.append(("lit", lit))
-            name = m.group(1)
-            var = m.group(2)
-            elements.append(("ref", name, var))
-            pos = m.end()
-        return elements
+        s = pattern
+        n = len(s)
 
-    # location helpers
+        def skip_spaces(p):
+            while p < n and s[p].isspace():
+                p += 1
+            return p
+
+        ident_re = re.compile(r"[A-Za-z_]\w*")
+
+        def parse_sequence(p, stop_char=None):
+            elems = []
+            p = skip_spaces(p)
+            while p < n:
+                if stop_char and s[p] == stop_char:
+                    return elems, p
+                c = s[p]
+                if c == "[" or c == "{":
+                    kind = "star" if c == "[" else "plus"
+                    endc = "]" if c == "[" else "}"
+                    p += 1
+                    inner_elems, p = parse_sequence(p, stop_char=endc)
+                    if p >= n or s[p] != endc:
+                        raise ValueError(f"Unclosed {c} in pattern: {pattern}")
+                    p += 1
+                    p = skip_spaces(p)
+                    var = None
+                    default = None
+                    if p < n and s[p] == ":":
+                        p += 1
+                        p = skip_spaces(p)
+                        m = ident_re.match(s, p)
+                        if not m:
+                            raise ValueError(f"Expected identifier after ':' in pattern: {pattern}")
+                        var = m.group(0)
+                        p = m.end()
+                    elems.append(("group", kind, inner_elems, var))
+                    p = skip_spaces(p)
+                    continue
+                elif c == "<":
+                    # find matching '>'
+                    end = p + 1
+                    depth = 1
+                    while end < n and depth > 0:
+                        if s[end] == "<":
+                            depth += 1
+                        elif s[end] == ">":
+                            depth -= 1
+                        end += 1
+                    if depth != 0:
+                        raise ValueError(f"Unclosed < in pattern: {pattern}")
+                    content = s[p + 1 : end - 1].strip()
+
+                    # parse with regex: name, optional quant (? * +), optional :var[=default]
+                    # quant is one char immediately after name (?,*,+)
+                    m = re.match(
+                        r"^([A-Za-z_]\w*)([?*+]?)\s*(?::\s*([A-Za-z_]\w*(?:\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^'\"]\S*))?))?$",
+                        content,
+                    )
+                    if not m:
+                        raise ValueError(f"Invalid <...> content: '{content}' in pattern: {pattern}")
+                    name = m.group(1)
+                    quant_sym = m.group(2) or ""
+                    varpart = m.group(3)
+
+                    quant = None
+                    if quant_sym == "?":
+                        quant = "optional"
+                    elif quant_sym == "*":
+                        quant = "star"
+                    elif quant_sym == "+":
+                        quant = "plus"
+
+                    var = None
+                    default = None
+                    if varpart:
+                        # varpart could be "x" or "x=42" or "x='a b'"
+                        if "=" in varpart:
+                            varname, defraw = varpart.split("=", 1)
+                            var = varname.strip()
+                            ds = defraw.strip()
+                            # try to literal_eval
+                            try:
+                                default = ast.literal_eval(ds)
+                            except Exception:
+                                # strip quotes if any or keep raw
+                                if (ds.startswith("'") and ds.endswith("'")) or (ds.startswith('"') and ds.endswith('"')):
+                                    default = ds[1:-1]
+                                else:
+                                    default = ds
+                        else:
+                            var = varpart.strip()
+
+                    elems.append(("ref", name, var, quant, default))
+                    p = end
+                    p = skip_spaces(p)
+                    continue
+                elif c == "'" or c == '"':
+                    quote = c
+                    end = p + 1
+                    lit_chars = []
+                    while end < n:
+                        if s[end] == "\\" and end + 1 < n:
+                            lit_chars.append(s[end + 1])
+                            end += 2
+                        elif s[end] == quote:
+                            end += 1
+                            break
+                        else:
+                            lit_chars.append(s[end])
+                            end += 1
+                    else:
+                        raise ValueError(f"Unclosed string literal in pattern: {pattern}")
+                    lit = "".join(lit_chars)
+                    elems.append(("lit", lit))
+                    p = skip_spaces(end)
+                    continue
+                else:
+                    m = re.match(r"[^<>\[\]\{\}\s]+", s[p:])
+                    if not m:
+                        raise ValueError(f"Unexpected char '{s[p]}' in pattern: {pattern}")
+                    tok = m.group(0)
+                    elems.append(("lit", tok))
+                    p += len(tok)
+                    p = skip_spaces(p)
+                    continue
+            if stop_char:
+                raise ValueError(f"Unclosed group in pattern: {pattern} (expected '{stop_char}')")
+            return elems, p
+
+        elems, _ = parse_sequence(0, stop_char=None)
+        return elems
+
+    # location helpers kept same
     def _loc(self, text: str, pos: int):
         if pos < 0:
             pos = 0
@@ -212,7 +320,7 @@ class Grammar(ABC):
             f"{message}\nLine {line}, Column {col}:{exp_part}\n{snippet}\n{caret}"
         )
 
-    # public parse entrypoint
+    # public parse entrypoint kept same, but we initialize memo cache per-parse
     def parse(self, text: str, start_rule: Optional[str] = None):
         if start_rule is None:
             start_rule = (
@@ -222,6 +330,10 @@ class Grammar(ABC):
             )
         if start_rule is None:
             raise RuntimeError("No rules defined")
+
+        # memoization cache: key -> (value, pos) or 'INPROG'
+        self._memo = {}
+
         val, pos = self._match_rule(start_rule, text, 0, min_prec=0)
         if self.skip_whitespace:
             while pos < len(text) and text[pos].isspace():
@@ -230,23 +342,34 @@ class Grammar(ABC):
             raise self._format_error("Unconsumed input", text, pos)
         return val
 
-    # Core matcher: supports direct left-recursive alts with precedence and prefix/postfix unary alts.
+    # Core matcher: extended to handle 'ref' with optional quant and 'group' elems (star/plus)
     def _match_rule(
         self, rule_name: str, text: str, pos: int, min_prec: int = 0
     ) -> Tuple[Any, int]:
         if rule_name not in self._rules:
             raise self._format_error(f"Unknown rule '{rule_name}'", text, pos)
 
-        alts = self._rules[rule_name]
+        # memoization check
+        key = (rule_name, pos, min_prec)
+        if hasattr(self, "_memo"):
+            cached = self._memo.get(key, None)
+            if cached is not None and cached != "INPROG":
+                return cached
+            if cached == "INPROG":
+                # avoid using memo while left-recursive computation in progress
+                pass
 
-        # remember the original min_prec for this invocation
+        # mark in-progress (to avoid infinite recursion in naive cycles)
+        if hasattr(self, "_memo"):
+            self._memo[key] = "INPROG"
+
+        alts = self._rules[rule_name]
         orig_min = min_prec
 
-        # partition alts into categories
-        non_left = []  # alts that do NOT start with a ref to the same rule
-        left_rec = []  # alts that DO start with ('ref', rule_name, var)  => treat as left-recursive operator patterns
-        prefix_unary = []  # alts with unary=='prefix'
-        postfix_unary = []  # alts with unary=='postfix'
+        non_left = []
+        left_rec = []
+        prefix_unary = []
+        postfix_unary = []
         for alt in alts:
             elems = alt["elems"]
             if elems and elems[0][0] == "ref" and elems[0][1] == rule_name:
@@ -258,7 +381,262 @@ class Grammar(ABC):
             else:
                 non_left.append(alt)
 
-        expected = []
+        expected: List[str] = []
+
+        # helper to match a sequence of elements and return (captured_args_list, newpos)
+        # on failure returns None
+        def match_sequence(elems, start_pos):
+            cur = start_pos
+            captures = []
+            for elem in elems:
+                if self.skip_whitespace:
+                    while cur < len(text) and text[cur].isspace():
+                        cur += 1
+                res = match_element(elem, cur)
+                if res is None:
+                    return None
+                elem_caps, new_pos = res
+                captures.extend(elem_caps)
+                cur = new_pos
+            return captures, cur
+
+        # create readable description for an element (used in error hints)
+        def elem_desc(e):
+            if e[0] == "lit":
+                return f"'{e[1]}'"
+            if e[0] == "ref":
+                return f"<{e[1]}>"
+            if e[0] == "group":
+                return "group"
+            return "item"
+
+        # match a single element; return (captured_vals_list, newpos) or None on failure
+        def match_element(elem, cur):
+            typ = elem[0]
+            if typ == "lit":
+                lit = elem[1]
+                if text.startswith(lit, cur):
+                    return ([], cur + len(lit))
+                else:
+                    expected.append(lit)
+                    return None
+            elif typ == "ref":
+                name, var, quant, default = elem[1], elem[2], elem[3], elem[4]
+                # token
+                if name in self._tokens:
+                    regex, convert = self._tokens[name]
+                    m = regex.match(text, cur)
+                    if not m:
+                        if quant == "optional":
+                            if var:
+                                # use default if provided, else None
+                                val = default if default is not None else None
+                                return ([val], cur)
+                            else:
+                                return ([], cur)
+                        # quant '*' (star) or '+' handled below with repetition loops
+                        if quant in ("star", "plus"):
+                            # attempt repetition loop for tokens:
+                            items = []
+                            curpos = cur
+                            # first required?
+                            first = regex.match(text, curpos)
+                            if not first:
+                                if quant == "plus":
+                                    expected.append(f"one or more {elem_desc(elem)}")
+                                    return None
+                                else:
+                                    # star, zero occurrences
+                                    if var:
+                                        return ([[]], curpos)
+                                    else:
+                                        return ([], curpos)
+                            # else loop
+                            while True:
+                                m2 = regex.match(text, curpos)
+                                if not m2:
+                                    break
+                                raw = m2.group(0)
+                                curpos = m2.end()
+                                items.append(convert(raw) if convert else raw)
+                                # avoid infinite loops if zero-length matches
+                                if curpos == m2.start():
+                                    break
+                            if var:
+                                return ([items], curpos)
+                            else:
+                                return ([], curpos)
+                        expected.append(f"<{name}>")
+                        return None
+                    raw = m.group(0)
+                    newcur = m.end()
+                    val = convert(raw) if convert else raw
+                    if quant in ("star", "plus"):
+                        # repetition for tokens
+                        items = [val]
+                        curpos = newcur
+                        while True:
+                            m2 = regex.match(text, curpos)
+                            if not m2:
+                                break
+                            raw2 = m2.group(0)
+                            curpos = m2.end()
+                            items.append(convert(raw2) if convert else raw2)
+                            if curpos == m2.start():
+                                break
+                        if var:
+                            return ([items], curpos)
+                        else:
+                            return ([], curpos)
+                    # optional handled earlier
+                    if var:
+                        return ([val], newcur)
+                    else:
+                        return ([], newcur)
+                else:
+                    # rule reference
+                    # repetition quant handling
+                    if quant in ("star", "plus"):
+                        items = []
+                        curpos = cur
+                        first_attempt = True
+                        while True:
+                            try:
+                                val, new_pos = self._match_rule(name, text, curpos, min_prec=0)
+                            except ParseError:
+                                val = None
+                                new_pos = None
+                            if val is None:
+                                if first_attempt and quant == "plus":
+                                    expected.append(f"one or more {elem_desc(elem)}")
+                                    return None
+                                break
+                            items.append(val)
+                            if new_pos is None or new_pos == curpos:
+                                # no progress -> break to avoid infinite loop
+                                break
+                            curpos = new_pos
+                            first_attempt = False
+                        if var:
+                            return ([items], curpos)
+                        else:
+                            return ([], curpos)
+                    # ordinary single rule reference
+                    try:
+                        val, new_pos = self._match_rule(name, text, cur, min_prec=0)
+                    except ParseError:
+                        if quant == "optional":
+                            if var:
+                                val_default = default if default is not None else None
+                                return ([val_default], cur)
+                            else:
+                                return ([], cur)
+                        expected.append(f"<{name}>")
+                        return None
+                    if var:
+                        return ([val], new_pos)
+                    else:
+                        return ([], new_pos)
+            elif typ == "group":
+                kind, inner_elems, var = elem[1], elem[2], elem[3]
+                items = []
+                curpos = cur
+
+                # helper to attempt one iteration of the inner sequence
+                def match_once(p):
+                    res = match_sequence(inner_elems, p)
+                    if res is None:
+                        return None
+                    inner_caps, newp = res
+                    if len(inner_caps) == 0:
+                        item = None
+                    elif len(inner_caps) == 1:
+                        item = inner_caps[0]
+                    else:
+                        item = tuple(inner_caps)
+                    return item, newp
+
+                first_match = match_once(curpos)
+                if kind == "plus":
+                    if first_match is None:
+                        # better error hint: what group expected
+                        if inner_elems:
+                            expected.append(f"one or more {elem_desc(inner_elems[0])}")
+                        else:
+                            expected.append("one or more (group)")
+                        return None
+                    item, curpos = first_match
+                    items.append(item)
+                    while True:
+                        nxt = match_once(curpos)
+                        if nxt is None:
+                            break
+                        item, curpos = nxt
+                        items.append(item)
+                else:  # star (zero-or-more)
+                    while True:
+                        nxt = match_once(curpos)
+                        if nxt is None:
+                            break
+                        item, curpos = nxt
+                        items.append(item)
+                if var:
+                    return ([items], curpos)
+                else:
+                    return ([], curpos)
+            else:
+                return None
+
+        # helper to run transform/validate and call semantic function (centralized)
+        # RETURNS: (ok: bool, value)
+        def call_semantic(alt, raw_args, start_pos):
+            transform_fn = alt.get("transform")
+            validate_fn = alt.get("validate")
+            args_for_call = raw_args
+            if transform_fn:
+                try:
+                    transformed = transform_fn(list(raw_args))
+                except ParseError:
+                    # rethrow parse errors from transform as is
+                    raise
+                except Exception as e:
+                    raise self._format_error(
+                        f"Error in transform for rule '{rule_name}': {e}", text, start_pos
+                    )
+                # None means treat as alt not matching
+                if transformed is None:
+                    return (False, None)
+                # normalize into iterable of args
+                if isinstance(transformed, (list, tuple)):
+                    args_for_call = list(transformed)
+                else:
+                    # single value -> wrap
+                    args_for_call = [transformed]
+            if validate_fn:
+                try:
+                    ok = validate_fn(list(raw_args))
+                except ParseError:
+                    raise
+                except Exception as e:
+                    raise self._format_error(
+                        f"Error in validate for rule '{rule_name}': {e}", text, start_pos
+                    )
+                if not ok:
+                    # treat as no match
+                    return (False, None)
+            # call semantic action
+            try:
+                if isinstance(args_for_call, (list, tuple)):
+                    val = alt["func"](*args_for_call)
+                else:
+                    val = alt["func"](args_for_call)
+                return (True, val)
+            except Exception as e:
+                raise self._format_error(
+                    f"Error in semantic action for rule '{rule_name}': {e}",
+                    text,
+                    start_pos,
+                )
 
         # Helper: match a plain alternative (no special left-rec growth) starting at pos.
         def try_match_alt(alt, start_pos):
@@ -268,52 +646,21 @@ class Grammar(ABC):
                 if self.skip_whitespace:
                     while cur < len(text) and text[cur].isspace():
                         cur += 1
-                if elem[0] == "lit":
-                    lit = elem[1]
-                    if text.startswith(lit, cur):
-                        cur += len(lit)
-                    else:
-                        expected.append(lit)
-                        return None
-                elif elem[0] == "ref":
-                    name, var = elem[1], elem[2]
-                    if name in self._tokens:
-                        regex, convert = self._tokens[name]
-                        m = regex.match(text, cur)
-                        if not m:
-                            expected.append(f"<{name}>")
-                            return None
-                        raw = m.group(0)
-                        cur = m.end()
-                        val = convert(raw) if convert else raw
-                        if var:
-                            args.append(val)
-                    else:
-                        # recursive rule call (normal recursion) - pass down min_prec=0 for nested calls
-                        try:
-                            val, new_pos = self._match_rule(name, text, cur, min_prec=0)
-                        except ParseError:
-                            expected.append(f"<{name}>")
-                            return None
-                        cur = new_pos
-                        if var:
-                            args.append(val)
-                else:
+                res = match_element(elem, cur)
+                if res is None:
                     return None
-            try:
-                return alt["func"](*args), cur
-            except Exception as e:
-                raise self._format_error(
-                    f"Error in semantic action for rule '{rule_name}': {e}",
-                    text,
-                    start_pos,
-                )
+                elem_caps, new_pos = res
+                args.extend(elem_caps)
+                cur = new_pos
+            # apply transform/validate and call semantic; if transform returns None or validate False -> treat as no match
+            sem_ok, sem_val = call_semantic(alt, args, start_pos)
+            if not sem_ok:
+                return None
+            return sem_val, cur
 
         # 1) Try prefix unary forms first (they create a seed)
         seeds = []
         for alt in prefix_unary:
-            # prefix form: match initial elements up to first <rule_name:...> which should be the recursive target
-            # But in our convention, prefix unary alt pattern should be like "'-' <{rule}:x>"
             elems = alt["elems"]
             cur = pos
             args = []
@@ -322,65 +669,36 @@ class Grammar(ABC):
                 if self.skip_whitespace:
                     while cur < len(text) and text[cur].isspace():
                         cur += 1
-                if elem[0] == "lit":
-                    if text.startswith(elem[1], cur):
-                        cur += len(elem[1])
-                    else:
+                if elem[0] == "ref" and elem[1] == rule_name:
+                    name = elem[1]
+                    var = elem[2]
+                    try:
+                        inner, new_pos = self._match_rule(
+                            name,
+                            text,
+                            cur,
+                            min_prec=alt["prec"] if alt["prec"] is not None else 0,
+                        )
+                    except ParseError:
                         ok = False
-                        expected.append(elem[1])
+                        expected.append(f"<{name}>")
                         break
-                elif elem[0] == "ref":
-                    name, var = elem[1], elem[2]
-                    if name == rule_name:
-                        # parse nested rule with min_prec = alt.prec (prefix binds to that precedence)
-                        try:
-                            inner, new_pos = self._match_rule(
-                                name,
-                                text,
-                                cur,
-                                min_prec=alt["prec"] if alt["prec"] is not None else 0,
-                            )
-                        except ParseError:
-                            ok = False
-                            expected.append(f"<{name}>")
-                            break
-                        cur = new_pos
-                        if var:
-                            args.append(inner)
-                    else:
-                        if name in self._tokens:
-                            regex, convert = self._tokens[name]
-                            m = regex.match(text, cur)
-                            if not m:
-                                ok = False
-                                expected.append(f"<{name}>")
-                                break
-                            raw = m.group(0)
-                            cur = m.end()
-                            val = convert(raw) if convert else raw
-                            if var:
-                                args.append(val)
-                        else:
-                            try:
-                                val, new_pos = self._match_rule(
-                                    name, text, cur, min_prec=0
-                                )
-                            except ParseError:
-                                ok = False
-                                expected.append(f"<{name}>")
-                                break
-                            cur = new_pos
-                            if var:
-                                args.append(val)
+                    cur = new_pos
+                    if var:
+                        args.append(inner)
+                else:
+                    res = match_element(elem, cur)
+                    if res is None:
+                        ok = False
+                        break
+                    elem_caps, new_pos = res
+                    args.extend(elem_caps)
+                    cur = new_pos
             if ok:
-                try:
-                    seeds.append((alt, alt["func"](*args), cur))
-                except Exception as e:
-                    raise self._format_error(
-                        f"Error in semantic action for rule '{rule_name}': {e}",
-                        text,
-                        pos,
-                    )
+                sem_ok, sem_val = call_semantic(alt, args, pos)
+                if sem_ok:
+                    seeds.append((alt, sem_val, cur))
+                # else transform/validate rejected alt -> not a seed
 
         # 2) Try non-left alternatives as seeds (in order)
         if not seeds:
@@ -393,6 +711,9 @@ class Grammar(ABC):
 
         if not seeds:
             # nothing matched as seed -> failure
+            # clean memo in-progress
+            if hasattr(self, "_memo"):
+                self._memo[key] = None
             raise self._format_error(
                 f"Failed to match rule '{rule_name}'",
                 text,
@@ -401,81 +722,45 @@ class Grammar(ABC):
             )
 
         # We'll grow each successful seed via left-recursive alts and postfix unary alts
-        # For simplicity, pick the first seed (most rules are deterministic)
         seed_alt, left_val, curpos = seeds[0]
 
-        # growth loop: repeatedly try to apply left-recursive alts (and postfix unary) while precedence allows
+        # growth loop: repeatedly try to apply left-recursive alts and postfix unary alts
         while True:
             progressed = False
 
             # First: postfix unary alternatives (they are like left-rec tails with no new LHS)
             for alt in postfix_unary:
-                # pattern typically "<{rule}:x> '!'"
                 elems = alt["elems"]
-                # match elems but substitute the first ref value with current left (we don't consume it from text)
-                # We expect elems to start with ('ref', rule_name, var)
                 if not (elems and elems[0][0] == "ref" and elems[0][1] == rule_name):
                     continue
                 tail = elems[1:]
                 cur = curpos
-                args = [left_val]  # first param is the LHS
+                args = [left_val]
                 ok = True
                 for elem in tail:
                     if self.skip_whitespace:
                         while cur < len(text) and text[cur].isspace():
                             cur += 1
-                    if elem[0] == "lit":
-                        if text.startswith(elem[1], cur):
-                            cur += len(elem[1])
-                        else:
-                            ok = False
-                            break
-                    elif elem[0] == "ref":
-                        name, var = elem[1], elem[2]
-                        if name in self._tokens:
-                            regex, convert = self._tokens[name]
-                            m = regex.match(text, cur)
-                            if not m:
-                                ok = False
-                                break
-                            raw = m.group(0)
-                            cur = m.end()
-                            val = convert(raw) if convert else raw
-                            if var:
-                                args.append(val)
-                        else:
-                            try:
-                                val, new_pos = self._match_rule(
-                                    name, text, cur, min_prec=0
-                                )
-                            except ParseError:
-                                ok = False
-                                break
-                            cur = new_pos
-                            if var:
-                                args.append(val)
+                    res = match_element(elem, cur)
+                    if res is None:
+                        ok = False
+                        break
+                    elem_caps, new_pos = res
+                    args.extend(elem_caps)
+                    cur = new_pos
                 if ok:
-                    # call semantic function - first arg is LHS
-                    try:
-                        new_left = alt["func"](*args)
-                    except Exception as e:
-                        raise self._format_error(
-                            f"Error in semantic action for rule '{rule_name}': {e}",
-                            text,
-                            curpos,
-                        )
-                    # update
-                    left_val = new_left
+                    sem_ok, sem_val = call_semantic(alt, args, curpos)
+                    if not sem_ok:
+                        # transform/validate rejected this application -> skip
+                        continue
+                    left_val = sem_val
                     curpos = cur
                     progressed = True
-                    # continue growth after successful postfix
                     break
             if progressed:
                 continue
 
             # Second: left-recursive binary-like alternatives
-            # We'll attempt any left-rec alt whose prec >= min_prec
-            # To make associativity consistent, we iterate through alts sorted by precedence descending (higher binds tighter)
             left_rec_sorted = sorted(
                 [a for a in left_rec if a["prec"] is not None], key=lambda x: -x["prec"]
             )
@@ -483,93 +768,53 @@ class Grammar(ABC):
             for alt in left_rec_sorted:
                 p = alt["prec"]
                 assoc = alt["assoc"]
-                # respect the original min_prec for this invocation
                 if p < orig_min:
                     continue
-                # tail elements after the leading self-ref
                 tail = alt["elems"][1:]
                 cur = curpos
-                args = [
-                    left_val
-                ]  # first parameter corresponds to the leading <rule:...>
+                args = [left_val]
                 ok = True
                 for elem in tail:
                     if self.skip_whitespace:
                         while cur < len(text) and text[cur].isspace():
                             cur += 1
-                    if elem[0] == "lit":
-                        if text.startswith(elem[1], cur):
-                            cur += len(elem[1])
-                        else:
+                    if elem[0] == "ref" and elem[1] == rule_name:
+                        rhs_min = p if assoc == "right" else (p + 1)
+                        try:
+                            val, new_pos = self._match_rule(elem[1], text, cur, min_prec=rhs_min)
+                        except ParseError:
                             ok = False
                             break
-                    elif elem[0] == "ref":
-                        name, var = elem[1], elem[2]
-                        if name in self._tokens:
-                            regex, convert = self._tokens[name]
-                            m = regex.match(text, cur)
-                            if not m:
-                                ok = False
-                                break
-                            raw = m.group(0)
-                            cur = m.end()
-                            val = convert(raw) if convert else raw
-                            if var:
-                                args.append(val)
-                        else:
-                            # previously we rejected recursive references to the same rule in the tail.
-                            # Instead, parse the RHS recursively with the correct min_prec so expressions like
-                            # "<expr:x> '+' <expr:y>" work.
-                            if name == rule_name:
-                                # compute min precedence for parsing RHS based on associativity:
-                                # - for left-assoc operators, RHS should be parsed with min_prec = p+1
-                                # - for right-assoc operators, RHS should be parsed with min_prec = p
-                                rhs_min = p if assoc == "right" else (p + 1)
-                                try:
-                                    val, new_pos = self._match_rule(
-                                        name, text, cur, min_prec=rhs_min
-                                    )
-                                except ParseError:
-                                    ok = False
-                                    break
-                                cur = new_pos
-                                if var:
-                                    args.append(val)
-                            else:
-                                try:
-                                    val, new_pos = self._match_rule(
-                                        name, text, cur, min_prec=0
-                                    )
-                                except ParseError:
-                                    ok = False
-                                    break
-                                cur = new_pos
-                                if var:
-                                    args.append(val)
+                        cur = new_pos
+                        if elem[2]:
+                            args.append(val)
+                    else:
+                        res = match_element(elem, cur)
+                        if res is None:
+                            ok = False
+                            break
+                        elem_caps, new_pos = res
+                        args.extend(elem_caps)
+                        cur = new_pos
                 if ok:
-                    # call semantic func - with left_val as first arg
-                    try:
-                        new_left = alt["func"](*args)
-                    except Exception as e:
-                        raise self._format_error(
-                            f"Error in semantic action for rule '{rule_name}': {e}",
-                            text,
-                            curpos,
-                        )
-
-                    # apply the growth (do not change orig_min here — keep the original min_prec).
-                    left_val = new_left
+                    sem_ok, sem_val = call_semantic(alt, args, curpos)
+                    if not sem_ok:
+                        # transform/validate rejected this alt application
+                        continue
+                    left_val = sem_val
                     curpos = cur
                     applied_any = True
-                    # continue scanning left-recursive alts (don't mutate orig_min)
-                    break  # restart scanning left-rec alts after successful application
+                    break
 
             if applied_any:
                 progressed = True
                 continue
 
-            # nothing applied this iteration -> break
             if not progressed:
                 break
+
+        # store memoized result
+        if hasattr(self, "_memo"):
+            self._memo[key] = (left_val, curpos)
 
         return left_val, curpos
