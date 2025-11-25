@@ -1,5 +1,6 @@
 import re
 import ast
+import inspect
 from abc import ABC
 from typing import Optional, Callable, List, Tuple, Any
 
@@ -79,11 +80,16 @@ def rule(
     unary: Optional[str] = None,
     transform: Optional[Callable[[List[Any]], Any]] = None,
     validate: Optional[Callable[[List[Any]], bool]] = None,
+    capture_anon: bool = False,
 ):
     """
     rule decorator. New kwargs:
       - transform: callable(args_list) -> iterable/new args (or None to reject alt)
       - validate: callable(args_list) -> bool (False => treat as not matched)
+      - capture_anon: if True, capture refs without explicit var names as
+                      positional arguments (useful for patterns like
+                      "<assignment> ::= <varname> '=' <expr>" and semantic
+                      actions that expect positional args for those refs).
     """
     if assoc not in ("left", "right"):
         raise ValueError("assoc must be 'left' or 'right'")
@@ -102,6 +108,7 @@ def rule(
                 "rule_name": name,
                 "transform": transform,
                 "validate": validate,
+                "capture_anon": capture_anon,
             }
         )
         fn._is_rule = True
@@ -128,23 +135,29 @@ class Grammar(ABC):
         for func_name, attr in self.__class__.__dict__.items():
             if hasattr(attr, "_is_rule"):
                 for alt_meta in getattr(attr, "_rule_alts", []):
-                    rule_name = alt_meta.get("rule_name")
+                    # alt_meta may contain a pattern with ::= left-hand side
+                    parsed_rule = self._parse_pattern(alt_meta["pattern"])
+                    # _parse_pattern now returns (maybe_rule_name, elems)
+                    parsed_rule_name, parsed_elems = parsed_rule
+
+                    # precedence: pattern-specified name > name kwarg > function name heuristic
+                    rule_name = parsed_rule_name or alt_meta.get("rule_name")
                     if not rule_name:
                         if "_" in func_name:
                             rule_name = func_name.split("_", 1)[0]
                         else:
                             rule_name = func_name
 
-                    parsed = self._parse_pattern(alt_meta["pattern"])
                     alt = {
                         "pattern_raw": alt_meta["pattern"],
-                        "elems": parsed,
+                        "elems": parsed_elems,
                         "prec": alt_meta["prec"],
                         "assoc": alt_meta["assoc"],
                         "unary": alt_meta["unary"],
                         "func": getattr(self, func_name),  # bound method
                         "transform": alt_meta.get("transform"),
                         "validate": alt_meta.get("validate"),
+                        "capture_anon": alt_meta.get("capture_anon", False),
                     }
                     if rule_name not in self._rules:
                         self._rules[rule_name] = []
@@ -158,8 +171,48 @@ class Grammar(ABC):
     #  - { ... }:var  one-or-more (group)
     #  - optional var default: <name?:var=42>
     #  - literals in single/double quotes or bare punctuation tokens (',' etc.)
+    #  - left-hand rule name via ::= e.g. "<expr> ::= <expr:left> '+' <expr:right>"
     def _parse_pattern(self, pattern: str):
         s = pattern
+        n = len(s)
+
+        # Detect top-level ::= (left-hand rule name) if present.
+        # We do a simple split on the first occurrence of '::=' that isn't inside quotes.
+        def find_top_level_assign(s):
+            i = 0
+            in_sq = False
+            in_dq = False
+            while i < len(s) - 2:
+                ch = s[i]
+                if ch == "'" and not in_dq:
+                    in_sq = not in_sq
+                    i += 1
+                    continue
+                if ch == '"' and not in_sq:
+                    in_dq = not in_dq
+                    i += 1
+                    continue
+                if not in_sq and not in_dq:
+                    if s[i:i+3] == "::=":
+                        return i
+                i += 1
+            return -1
+
+        assign_idx = find_top_level_assign(s)
+        lhs_name = None
+        rhs = s
+        if assign_idx != -1:
+            lhs = s[:assign_idx].strip()
+            rhs = s[assign_idx+3:].strip()
+            # if lhs is like "<expr>" extract expr, otherwise if plain word, use it
+            if lhs.startswith("<") and lhs.endswith(">"):
+                inner = lhs[1:-1].strip()
+                if re.match(r"[A-Za-z_]\w*$", inner):
+                    lhs_name = inner
+            elif re.match(r"[A-Za-z_]\w*$", lhs):
+                lhs_name = lhs
+
+        s = rhs
         n = len(s)
 
         def skip_spaces(p):
@@ -199,7 +252,7 @@ class Grammar(ABC):
                     p = skip_spaces(p)
                     continue
                 elif c == "<":
-                    # find matching '>'
+                    # find matching '>' (no nesting expected for refs)
                     end = p + 1
                     depth = 1
                     while end < n and depth > 0:
@@ -213,7 +266,6 @@ class Grammar(ABC):
                     content = s[p + 1 : end - 1].strip()
 
                     # parse with regex: name, optional quant (? * +), optional :var[=default]
-                    # quant is one char immediately after name (?,*,+)
                     m = re.match(
                         r"^([A-Za-z_]\w*)([?*+]?)\s*(?::\s*([A-Za-z_]\w*(?:\s*=\s*(?:'[^']*'|\"[^\"]*\"|[^'\"]\S*))?))?$",
                         content,
@@ -260,18 +312,41 @@ class Grammar(ABC):
                     quote = c
                     end = p + 1
                     lit_chars = []
-                    while end < n:
-                        if s[end] == "\\" and end + 1 < n:
-                            lit_chars.append(s[end + 1])
-                            end += 2
-                        elif s[end] == quote:
-                            end += 1
-                            break
+                    if quote == "'":
+                        # SQL-style doubling: '' -> single quote inside literal
+                        while end < n:
+                            if s[end] == "'" :
+                                # if doubled single quote -> append one and advance by 2
+                                if end + 1 < n and s[end + 1] == "'":
+                                    lit_chars.append("'")
+                                    end += 2
+                                    continue
+                                # otherwise end of literal
+                                end += 1
+                                break
+                            elif s[end] == "\\" and end + 1 < n:
+                                # allow backslash escapes as well
+                                lit_chars.append(s[end + 1])
+                                end += 2
+                            else:
+                                lit_chars.append(s[end])
+                                end += 1
                         else:
-                            lit_chars.append(s[end])
-                            end += 1
+                            raise ValueError(f"Unclosed string literal in pattern: {pattern}")
                     else:
-                        raise ValueError(f"Unclosed string literal in pattern: {pattern}")
+                        # double-quoted: allow backslash escapes
+                        while end < n:
+                            if s[end] == "\\" and end + 1 < n:
+                                lit_chars.append(s[end + 1])
+                                end += 2
+                            elif s[end] == quote:
+                                end += 1
+                                break
+                            else:
+                                lit_chars.append(s[end])
+                                end += 1
+                        else:
+                            raise ValueError(f"Unclosed string literal in pattern: {pattern}")
                     lit = "".join(lit_chars)
                     elems.append(("lit", lit))
                     p = skip_spaces(end)
@@ -290,7 +365,7 @@ class Grammar(ABC):
             return elems, p
 
         elems, _ = parse_sequence(0, stop_char=None)
-        return elems
+        return lhs_name, elems
 
     # location helpers kept same
     def _loc(self, text: str, pos: int):
@@ -316,8 +391,14 @@ class Grammar(ABC):
         snippet = text[line_start:line_end]
         caret = " " * (col - 1) + "^"
         exp_part = f"\nExpected: {', '.join(expected)}" if expected else ""
+        # small lookahead to show what token or chars were actually found
+        lookahead_len = 20
+        found = text[pos: pos+lookahead_len]
+        # trim whitespace in found for clarity
+        found_disp = found.replace("\n", "\\n")
+        found_part = f"\nFound: '{found_disp}'" if found_disp else ""
         return ParseError(
-            f"{message}\nLine {line}, Column {col}:{exp_part}\n{snippet}\n{caret}"
+            f"{message}\nLine {line}, Column {col}:{exp_part}{found_part}\n{snippet}\n{caret}"
         )
 
     # public parse entrypoint kept same, but we initialize memo cache per-parse
@@ -385,14 +466,14 @@ class Grammar(ABC):
 
         # helper to match a sequence of elements and return (captured_args_list, newpos)
         # on failure returns None
-        def match_sequence(elems, start_pos):
+        def match_sequence(elems, start_pos, capture_anon=False):
             cur = start_pos
             captures = []
             for elem in elems:
                 if self.skip_whitespace:
                     while cur < len(text) and text[cur].isspace():
                         cur += 1
-                res = match_element(elem, cur)
+                res = match_element(elem, cur, capture_anon=capture_anon)
                 if res is None:
                     return None
                 elem_caps, new_pos = res
@@ -411,7 +492,7 @@ class Grammar(ABC):
             return "item"
 
         # match a single element; return (captured_vals_list, newpos) or None on failure
-        def match_element(elem, cur):
+        def match_element(elem, cur, capture_anon=False):
             typ = elem[0]
             if typ == "lit":
                 lit = elem[1]
@@ -432,6 +513,8 @@ class Grammar(ABC):
                                 # use default if provided, else None
                                 val = default if default is not None else None
                                 return ([val], cur)
+                            elif capture_anon:
+                                return ([None], cur)
                             else:
                                 return ([], cur)
                         # quant '*' (star) or '+' handled below with repetition loops
@@ -449,6 +532,8 @@ class Grammar(ABC):
                                     # star, zero occurrences
                                     if var:
                                         return ([[]], curpos)
+                                    elif capture_anon:
+                                        return ([[]], curpos)
                                     else:
                                         return ([], curpos)
                             # else loop
@@ -463,6 +548,8 @@ class Grammar(ABC):
                                 if curpos == m2.start():
                                     break
                             if var:
+                                return ([items], curpos)
+                            elif capture_anon:
                                 return ([items], curpos)
                             else:
                                 return ([], curpos)
@@ -486,10 +573,14 @@ class Grammar(ABC):
                                 break
                         if var:
                             return ([items], curpos)
+                        elif capture_anon:
+                            return ([items], curpos)
                         else:
                             return ([], curpos)
                     # optional handled earlier
                     if var:
+                        return ([val], newcur)
+                    elif capture_anon:
                         return ([val], newcur)
                     else:
                         return ([], newcur)
@@ -519,6 +610,8 @@ class Grammar(ABC):
                             first_attempt = False
                         if var:
                             return ([items], curpos)
+                        elif capture_anon:
+                            return ([items], curpos)
                         else:
                             return ([], curpos)
                     # ordinary single rule reference
@@ -529,11 +622,15 @@ class Grammar(ABC):
                             if var:
                                 val_default = default if default is not None else None
                                 return ([val_default], cur)
+                            elif capture_anon:
+                                return ([None], cur)
                             else:
                                 return ([], cur)
                         expected.append(f"<{name}>")
                         return None
                     if var:
+                        return ([val], new_pos)
+                    elif capture_anon:
                         return ([val], new_pos)
                     else:
                         return ([], new_pos)
@@ -544,7 +641,7 @@ class Grammar(ABC):
 
                 # helper to attempt one iteration of the inner sequence
                 def match_once(p):
-                    res = match_sequence(inner_elems, p)
+                    res = match_sequence(inner_elems, p, capture_anon=capture_anon)
                     if res is None:
                         return None
                     inner_caps, newp = res
@@ -581,6 +678,8 @@ class Grammar(ABC):
                         item, curpos = nxt
                         items.append(item)
                 if var:
+                    return ([items], curpos)
+                elif capture_anon:
                     return ([items], curpos)
                 else:
                     return ([], curpos)
@@ -626,10 +725,20 @@ class Grammar(ABC):
                     return (False, None)
             # call semantic action
             try:
-                if isinstance(args_for_call, (list, tuple)):
-                    val = alt["func"](*args_for_call)
+                # attempt to match function signature if bound method expects fewer args
+                sig = inspect.signature(alt["func"])
+                # build a simple positional dispatch: if the function expects N params
+                # (excluding self for bound methods), supply only the first N args.
+                params = list(sig.parameters.values())
+                # bound method: first parameter is usually 'self' -> omit it
+                if params and params[0].name == 'self':
+                    params = params[1:]
+                expected_param_count = len([p for p in params if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)])
+                if expected_param_count != 0:
+                    call_args = args_for_call[:expected_param_count]
                 else:
-                    val = alt["func"](args_for_call)
+                    call_args = args_for_call
+                val = alt["func"](*call_args)
                 return (True, val)
             except Exception as e:
                 raise self._format_error(
@@ -646,7 +755,7 @@ class Grammar(ABC):
                 if self.skip_whitespace:
                     while cur < len(text) and text[cur].isspace():
                         cur += 1
-                res = match_element(elem, cur)
+                res = match_element(elem, cur, capture_anon=alt.get("capture_anon", False))
                 if res is None:
                     return None
                 elem_caps, new_pos = res
@@ -686,8 +795,10 @@ class Grammar(ABC):
                     cur = new_pos
                     if var:
                         args.append(inner)
+                    elif alt.get("capture_anon", False):
+                        args.append(inner)
                 else:
-                    res = match_element(elem, cur)
+                    res = match_element(elem, cur, capture_anon=alt.get("capture_anon", False))
                     if res is None:
                         ok = False
                         break
@@ -741,7 +852,7 @@ class Grammar(ABC):
                     if self.skip_whitespace:
                         while cur < len(text) and text[cur].isspace():
                             cur += 1
-                    res = match_element(elem, cur)
+                    res = match_element(elem, cur, capture_anon=alt.get("capture_anon", False))
                     if res is None:
                         ok = False
                         break
@@ -788,8 +899,10 @@ class Grammar(ABC):
                         cur = new_pos
                         if elem[2]:
                             args.append(val)
+                        elif alt.get("capture_anon", False):
+                            args.append(val)
                     else:
-                        res = match_element(elem, cur)
+                        res = match_element(elem, cur, capture_anon=alt.get("capture_anon", False))
                         if res is None:
                             ok = False
                             break
@@ -818,3 +931,4 @@ class Grammar(ABC):
             self._memo[key] = (left_val, curpos)
 
         return left_val, curpos
+    
