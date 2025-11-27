@@ -294,6 +294,21 @@ class Grammar(ABC):
                             sec_capturable = (sec_var is not None) or (
                                 token_info is not None and (token_info[2] or looks_wordlike)
                             )
+                            # first must look like a separator: either a literal, or a ref
+                            # to a token that is used unnamed (no var). This matches common
+                            # patterns like [',' <item>]:rest or [ <COMMA> <item> ]:rest.
+                            first_is_sep = False
+                            if first[0] == "lit":
+                                first_is_sep = True
+                            elif first[0] == "ref":
+                                # ref like <COMMA> or <COMMA:foo> - sep must be unnamed ref
+                                # to be a separator; named captures inside sep would be odd.
+                                if first[2] is None:
+                                    first_is_sep = True
+
+                            if sec_capturable and first_is_sep:
+                                # Create sugar node: ('group_sugar', kind, sep_elem, item_elem, var)
+                                group_node = ("group_sugar", kind, first, second, var)
                     elems.append(group_node)
                     p = skip_spaces(p)
                     continue
@@ -402,7 +417,20 @@ class Grammar(ABC):
                                 f"Unclosed string literal in pattern: {pattern}"
                             )
                     lit = "".join(lit_chars)
-                    elems.append(("lit", lit))
+
+                    # check for immediate unquoted quantifier ? * +
+                    quant = None
+                    if end < n and s[end] in "?*+":
+                        qch = s[end]
+                        end += 1
+                        if qch == "?":
+                            quant = "optional"
+                        elif qch == "*":
+                            quant = "star"
+                        elif qch == "+":
+                            quant = "plus"
+
+                    elems.append(("lit", lit, quant))
                     p = skip_spaces(end)
                     continue
                 else:
@@ -413,8 +441,21 @@ class Grammar(ABC):
                             f"Unexpected char '{s[p]}' in pattern: {pattern}"
                         )
                     tok = m.group(0)
-                    elems.append(("lit", tok))
                     p += len(tok)
+
+                    # check for immediate unquoted quantifier ? * +
+                    quant = None
+                    if p < n and s[p] in "?*+":
+                        qch = s[p]
+                        p += 1
+                        if qch == "?":
+                            quant = "optional"
+                        elif qch == "*":
+                            quant = "star"
+                        elif qch == "+":
+                            quant = "plus"
+
+                    elems.append(("lit", tok, quant))
                     p = skip_spaces(p)
                     continue
             if stop_char:
@@ -431,8 +472,16 @@ class Grammar(ABC):
             for e in items:
                 if e[0] == "group" or e[0] == "group_sugar":
                     # group node: ('group', kind, inner_elems, var) or sugar variant
-                    varname = e[3] if e[0] == "group" else e[4]
-                    inner = e[2] if e[0] == "group" else e[3]
+                    # pick varname and inner elements consistently
+                    if e[0] == "group":
+                        varname = e[3]
+                        inner = e[2]
+                    else:
+                        # group_sugar: ('group_sugar', kind, sep_elem, item_elem, var)
+                        varname = e[4]
+                        # present inner as a list [sep_elem, item_elem] so the walker
+                        # can iterate over elements uniformly.
+                        inner = [e[2], e[3]]
                     if varname is not None:
                         # Warn if any inner element is a token ref with capture_by_default True and is unnamed
                         for ie in inner:
@@ -606,6 +655,43 @@ class Grammar(ABC):
             typ = elem[0]
             if typ == "lit":
                 lit = elem[1]
+                quant = elem[2] if len(elem) > 2 else None
+
+                # no quantifier: exact single match required
+                if not quant:
+                    if text.startswith(lit, cur):
+                        return ([], cur + len(lit))
+                    else:
+                        expected.append(lit)
+                        return None
+
+                # optional literal: consume if present, otherwise succeed without consuming
+                if quant == "optional":
+                    if text.startswith(lit, cur):
+                        return ([], cur + len(lit))
+                    else:
+                        return ([], cur)
+
+                # star/plus: repeat the literal as many times as possible
+                if quant in ("star", "plus"):
+                    items_count = 0
+                    curpos = cur
+                    # avoid infinite loop on empty literal
+                    if len(lit) == 0:
+                        # empty literal repeated -> treat as zero occurrences
+                        if quant == "plus":
+                            expected.append(f"one or more '{lit}'")
+                            return None
+                        return ([], curpos)
+                    while text.startswith(lit, curpos):
+                        curpos += len(lit)
+                        items_count += 1
+                    if items_count == 0 and quant == "plus":
+                        expected.append(f"one or more '{lit}'")
+                        return None
+                    return ([], curpos)
+
+                # unknown quant (shouldn't happen) -> treat as exact
                 if text.startswith(lit, cur):
                     return ([], cur + len(lit))
                 else:
@@ -682,6 +768,82 @@ class Grammar(ABC):
                         return ([val], newcur)
                     else:
                         return ([], newcur)
+                # ---- non-token (rule) ref case ----
+                # If the ref name is not a token, treat it as a rule reference.
+                # Support optional/star/plus quantifiers and :var default for optional.
+                else:
+                    # NOTE: use min_prec=0 for ordinary nested rule calls from match_element.
+                    # Using orig_min here is too restrictive for many sub-expressions (breaks
+                    # parenthesized RHS like '(3 + 4)' when used as the RHS of '*').
+                    # Left-recursive growth code (above) still uses rhs_min correctly.
+                    # no quantifier -> single rule match required
+                    if quant is None:
+                        try:
+                            val, newpos = self._match_rule(name, text, cur, min_prec=0)
+                        except ParseError:
+                            expected.append(f"<{name}>")
+                            return None
+                        # capture depending on :var or anonymous-capture request
+                        if var or capture_anon:
+                            return ([val], newpos)
+                        else:
+                            return ([], newpos)
+
+                    # optional quantifier
+                    if quant == "optional":
+                        try:
+                            val, newpos = self._match_rule(name, text, cur, min_prec=0)
+                        except ParseError:
+                            # not present
+                            if var:
+                                val_default = default if default is not None else None
+                                return ([val_default], cur)
+                            elif capture_anon:
+                                return ([None], cur)
+                            else:
+                                return ([], cur)
+                        # present
+                        if var or capture_anon:
+                            return ([val], newpos)
+                        else:
+                            return ([], newpos)
+
+                    # star/plus repetition for rule refs
+                    if quant in ("star", "plus"):
+                        items = []
+                        curpos = cur
+                        # attempt first occurrence
+                        try:
+                            first, newpos = self._match_rule(name, text, curpos, min_prec=0)
+                        except ParseError:
+                            if quant == "plus":
+                                expected.append(f"one or more <{name}>")
+                                return None
+                            # star and none matched
+                            if var or capture_anon:
+                                return ([[]], curpos)
+                            else:
+                                return ([], curpos)
+                        items.append(first)
+                        curpos = newpos
+                        # subsequent occurrences
+                        while True:
+                            try:
+                                nxt, newpos = self._match_rule(name, text, curpos, min_prec=0)
+                            except ParseError:
+                                break
+                            if newpos == curpos:
+                                break
+                            items.append(nxt)
+                            curpos = newpos
+                        if var or capture_anon:
+                            return ([items], curpos)
+                        else:
+                            return ([], curpos)
+
+                    # fallback (shouldn't happen)
+                    expected.append(f"<{name}>")
+                    return None
 
             elif typ == "group_sugar":
                 # sugar node: ('group_sugar', kind, sep_elem, item_elem, var)
@@ -691,12 +853,22 @@ class Grammar(ABC):
 
                 def match_once(p):
                     # first match sep, then item
+                    # skip leading whitespace before the separator (group sugar may be used inline)
+                    if self.skip_whitespace:
+                        while p < len(text) and text[p].isspace():
+                            p += 1
                     # sep shouldn't be captured — pass capture_anon=False
                     res1 = match_element(sep_elem, p, capture_anon=False)
                     if res1 is None:
                         return None
                     _, pos_after_sep = res1
-                    res2 = match_element(item_elem, pos_after_sep, capture_anon=False)
+                    # skip whitespace after separator (common: ', ' between items)
+                    if self.skip_whitespace:
+                        while pos_after_sep < len(text) and text[pos_after_sep].isspace():
+                            pos_after_sep += 1
+                    # IMPORTANT: request anonymous capture for the item so tokens like <ident>
+                    # are returned even when they have no explicit ':name' in the pattern.
+                    res2 = match_element(item_elem, pos_after_sep, capture_anon=True)
                     if res2 is None:
                         return None
                     item_caps, newp = res2
